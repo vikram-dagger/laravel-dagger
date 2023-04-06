@@ -8,6 +8,8 @@ class DaggerPipeline {
 
   private $client;
 
+  // utility function to run raw GraphQL queries
+  // and recurse over result to return innermost leaf node
   private function executeQuery($query) {
     $response = $this->client->runRawQuery($query);
     $data = (array)($response->getData());
@@ -18,12 +20,12 @@ class DaggerPipeline {
     return $results[0];
   }
 
+  // constructor
   public function __construct() {
     // initialize client with
     // endpoint from environment
     $sessionPort = getenv('DAGGER_SESSION_PORT') or throw new Exception("DAGGER_SESSION_PORT doesn't exist");
     $sessionToken = getenv('DAGGER_SESSION_TOKEN') or throw new Exception("DAGGER_SESSION_TOKEN doesn't exist");
-
     $this->client = new Client(
       'http://127.0.0.1:' . $sessionPort . '/query',
       ['Authorization' => 'Basic ' . base64_encode($sessionToken . ':')]
@@ -31,7 +33,9 @@ class DaggerPipeline {
     return;
   }
 
+  // build image
   public function build() {
+    // get host working directory
     $sourceQuery = <<<QUERY
     query {
       host {
@@ -43,6 +47,9 @@ class DaggerPipeline {
     QUERY;
     $sourceDir = $this->executeQuery($sourceQuery);
 
+    // build runtime image
+    // install tools and PHP extensions
+    // configure Apache webserver root and rewriting
     $runtimeQuery = <<<QUERY
     query {
       container {
@@ -68,6 +75,9 @@ class DaggerPipeline {
     QUERY;
     $runtime = $this->executeQuery($runtimeQuery);
 
+    // add application source code
+    // set file permissions
+    // set environment variables
     $appQuery = <<<QUERY
     query {
       container (id: "$runtime") {
@@ -91,6 +101,8 @@ class DaggerPipeline {
     QUERY;
     $app = $this->executeQuery($appQuery);
 
+    // install Composer
+    // add application dependencies
     $appWithDepsQuery = <<<QUERY
     query {
       container (id: "$app") {
@@ -108,7 +120,9 @@ class DaggerPipeline {
     return $appWithDeps;
   }
 
+  // test image
   public function test($image) {
+    // create database service container
     $dbQuery = <<<QUERY
     query {
       container {
@@ -117,8 +131,10 @@ class DaggerPipeline {
             withEnvVariable(name: "MARIADB_USER", value: "tuser") {
               withEnvVariable(name: "MARIADB_PASSWORD", value: "tpassword") {
                 withEnvVariable(name: "MARIADB_ROOT_PASSWORD", value: "root") {
-                  withExec(args: []) {
-                    id
+                  withExposedPort(port: 3306) {
+                    withExec(args: []) {
+                      id
+                    }
                   }
                 }
               }
@@ -130,6 +146,9 @@ class DaggerPipeline {
     QUERY;
     $db = $this->executeQuery($dbQuery);
 
+    // bind database service to application image
+    // set database credentials for application
+    // run all PHPUnit tests
     $testQuery = <<<QUERY
     query {
       container (id: "$image") {
@@ -155,9 +174,13 @@ class DaggerPipeline {
     return $test;
   }
 
+  // publish image to Docker Hub registry
   public function publish($image) {
+    // retrieve Docker Hub registry credentials from host environment
     $registryUsername = getenv("REGISTRY_USERNAME");
     $registryPassword = getenv("REGISTRY_PASSWORD");
+
+    // set registry password as Dagger secret
     $registryPasswordSecretQuery = <<<QUERY
     query {
       setSecret(name: "password", plaintext: "$registryPassword") {
@@ -167,6 +190,8 @@ class DaggerPipeline {
     QUERY;
     $registryPasswordSecret = $this->executeQuery($registryPasswordSecretQuery);
 
+    // authenticate to Docker Hub registry
+    // publish image
     $publishQuery = <<<QUERY
     query {
       container (id: "$image") {
@@ -184,17 +209,21 @@ class DaggerPipeline {
 
 }
 
+// run pipeline
 try {
   $p = new DaggerPipeline();
 
+  // build
   echo "Building image..." . PHP_EOL;
   $image = $p->build();
   echo "Image built." . PHP_EOL;
 
+  // test
   echo "Testing image..." . PHP_EOL;
   $result = $p->test($image);
   echo "Image tested." . PHP_EOL;
 
+  // publish
   echo "Publishing image..." . PHP_EOL;
   $address = $p->publish($image);
   echo "Image published at: $address" . PHP_EOL;
