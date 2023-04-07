@@ -1,27 +1,32 @@
 <?php
+
 // include auto-loader
 include 'vendor/autoload.php';
 
 use GraphQL\Client;
 
-class DaggerPipeline {
-
+class DaggerPipeline
+{
   private $client;
 
   // utility function to run raw GraphQL queries
   // and recurse over result to return innermost leaf node
-  private function executeQuery($query) {
+  private function executeQuery($query)
+  {
     $response = $this->client->runRawQuery($query);
     $data = (array)($response->getData());
     foreach(new RecursiveIteratorIterator(
-      new RecursiveArrayIterator($data), RecursiveIteratorIterator::LEAVES_ONLY) as $value) {
+      new RecursiveArrayIterator($data),
+      RecursiveIteratorIterator::LEAVES_ONLY
+    ) as $value) {
       $results[] = $value;
     }
     return $results[0];
   }
 
   // constructor
-  public function __construct() {
+  public function __construct()
+  {
     // initialize client with
     // endpoint from environment
     $sessionPort = getenv('DAGGER_SESSION_PORT') or throw new Exception("DAGGER_SESSION_PORT doesn't exist");
@@ -30,11 +35,11 @@ class DaggerPipeline {
       'http://127.0.0.1:' . $sessionPort . '/query',
       ['Authorization' => 'Basic ' . base64_encode($sessionToken . ':')]
     );
-    return;
   }
 
-  // build image
-  public function build() {
+  // build base image
+  public function buildBaseImage()
+  {
     // get host working directory
     $sourceQuery = <<<QUERY
     query {
@@ -86,10 +91,8 @@ class DaggerPipeline {
             withExec(args: ["cp", "-R", ".", "/var/www"]) {
               withExec(args: ["chown", "-R", "www-data:www-data", "/var/www"]) {
                 withExec(args: ["chmod", "-R", "777", "/var/www/storage"]) {
-                  withEnvVariable(name: "APP_NAME", value: "Laravel with Dagger") {
-                    withExec(args: ["chmod", "+x", "/var/www/docker-entrypoint.sh"]) {
-                      id
-                    }
+                  withExec(args: ["chmod", "+x", "/var/www/docker-entrypoint.sh"]) {
+                    id
                   }
                 }
               }
@@ -120,16 +123,63 @@ class DaggerPipeline {
     return $appWithDeps;
   }
 
-  // test image
-  public function test($image) {
+  // build image for testing
+  public function buildTestImage()
+  {
+    // build base image
+    $image = $this->buildBaseImage();
+
+    // set test-specific variables
+    $appTestQuery = <<<QUERY
+    query {
+      container (id: "$image") {
+        withEnvVariable(name: "APP_DEBUG", value: "true") {
+          withEnvVariable(name: "LOG_LEVEL", value: "debug") {
+            id
+          }
+        }
+      }
+    }
+    QUERY;
+    $appTest = $this->executeQuery($appTestQuery);
+    return $appTest;
+  }
+
+  // build image for production
+  public function buildProductionImage()
+  {
+    // build base image
+    $image = $this->buildBaseImage();
+
+    // set production-specific variables
+    $appProductionQuery = <<<QUERY
+    query {
+      container (id: "$image") {
+        withEnvVariable(name: "APP_DEBUG", value: "false") {
+          withEnvVariable(name: "APP_NAME", value: "Laravel with Dagger") {
+            withEntrypoint(args: "/var/www/docker-entrypoint.sh") {
+              id
+            }
+          }
+        }
+      }
+    }
+    QUERY;
+    $appProduction = $this->executeQuery($appProductionQuery);
+    return $appProduction;
+  }
+
+  // run unit tests
+  public function testImage($image)
+  {
     // create database service container
     $dbQuery = <<<QUERY
     query {
       container {
         from(address: "mariadb:10.11.2") {
-          withEnvVariable(name: "MARIADB_DATABASE", value: "tdb") {
-            withEnvVariable(name: "MARIADB_USER", value: "tuser") {
-              withEnvVariable(name: "MARIADB_PASSWORD", value: "tpassword") {
+          withEnvVariable(name: "MARIADB_DATABASE", value: "t_db") {
+            withEnvVariable(name: "MARIADB_USER", value: "t_user") {
+              withEnvVariable(name: "MARIADB_PASSWORD", value: "t_password") {
                 withEnvVariable(name: "MARIADB_ROOT_PASSWORD", value: "root") {
                   withExposedPort(port: 3306) {
                     withExec(args: []) {
@@ -152,11 +202,11 @@ class DaggerPipeline {
     $testQuery = <<<QUERY
     query {
       container (id: "$image") {
-        withServiceBinding(alias: "test_db_service", service: "$db") {
-          withEnvVariable(name: "DB_HOST", value: "test_db_service") {
-            withEnvVariable(name: "DB_USERNAME", value: "tuser") {
-              withEnvVariable(name: "DB_PASSWORD", value: "tpassword") {
-                withEnvVariable(name: "DB_DATABASE", value: "tdb") {
+        withServiceBinding(alias: "mariadb", service: "$db") {
+          withEnvVariable(name: "DB_HOST", value: "mariadb") {
+            withEnvVariable(name: "DB_USERNAME", value: "t_user") {
+              withEnvVariable(name: "DB_PASSWORD", value: "t_password") {
+                withEnvVariable(name: "DB_DATABASE", value: "t_db") {
                   withWorkdir(path: "/var/www") {
                     withExec(args: ["./vendor/bin/phpunit", "-vv"]) {
                       stdout
@@ -174,9 +224,10 @@ class DaggerPipeline {
     return $test;
   }
 
-  // publish image to Docker Hub registry
-  public function publish($image) {
-    // retrieve Docker Hub registry credentials from host environment
+  // publish image to registry
+  public function publishImage($image)
+  {
+    // retrieve registry credentials from host environment
     $registryUsername = getenv("REGISTRY_USERNAME");
     $registryPassword = getenv("REGISTRY_PASSWORD");
 
@@ -190,15 +241,13 @@ class DaggerPipeline {
     QUERY;
     $registryPasswordSecret = $this->executeQuery($registryPasswordSecretQuery);
 
-    // authenticate to Docker Hub registry
+    // authenticate to registry
     // publish image
     $publishQuery = <<<QUERY
     query {
       container (id: "$image") {
-        withEntrypoint(args: "/var/www/docker-entrypoint.sh") {
-          withRegistryAuth(address: "docker.io", username: "$registryUsername", secret: "$registryPasswordSecret") {
-            publish(address: "$registryUsername/laravel-dagger")
-          }
+        withRegistryAuth(address: "docker.io", username: "$registryUsername", secret: "$registryPasswordSecret") {
+          publish(address: "$registryUsername/laravel-dagger")
         }
       }
     }
@@ -213,20 +262,25 @@ class DaggerPipeline {
 try {
   $p = new DaggerPipeline();
 
-  // build
-  echo "Building image..." . PHP_EOL;
-  $image = $p->build();
-  echo "Image built." . PHP_EOL;
+  // build test image
+  echo "Building test image..." . PHP_EOL;
+  $testImage = $p->buildTestImage();
+  echo "Test image built." . PHP_EOL;
 
   // test
-  echo "Testing image..." . PHP_EOL;
-  $result = $p->test($image);
-  echo "Image tested." . PHP_EOL;
+  echo "Running tests in test image..." . PHP_EOL;
+  $result = $p->testImage($testImage);
+  echo "Tests completed." . PHP_EOL;
+
+  // build production image
+  echo "Building production image..." . PHP_EOL;
+  $prodImage = $p->buildProductionImage();
+  echo "Production image built." . PHP_EOL;
 
   // publish
-  echo "Publishing image..." . PHP_EOL;
-  $address = $p->publish($image);
-  echo "Image published at: $address" . PHP_EOL;
+  echo "Publishing production image..." . PHP_EOL;
+  $address = $p->publishImage($prodImage);
+  echo "Production image published at: $address" . PHP_EOL;
 } catch (Exception $e) {
   print_r($e->getMessage());
   exit;
